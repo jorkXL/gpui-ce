@@ -2975,9 +2975,12 @@ impl Window {
         self.captured_hitbox = Some(hitbox_id);
     }
 
-    /// Releases any active pointer capture.
+    /// Releases the captured hitbox and any native pointer capture this window owns.
+    /// Without a captured hitbox, this does not change native capture.
     pub fn release_pointer(&mut self) {
-        self.captured_hitbox = None;
+        if self.captured_hitbox.take().is_some() {
+            self.platform_window.release_pointer_capture();
+        }
     }
 
     /// Returns the hitbox that has captured the pointer, if any.
@@ -8020,6 +8023,40 @@ mod tests {
             test_window.frame_wake_count() > baseline || callback_ran.get(),
             "a frame request with pending next-frame callbacks must either run them or re-arm the frame source"
         );
+    }
+
+    #[gpui::test]
+    fn pointer_capture_release_reaches_platform_once_without_mouse_up(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let platform_window = cx.test_window(window.into());
+        window
+            .update(cx, |_, window, _| {
+                window.release_pointer();
+                assert_eq!(platform_window.pointer_capture_release_count(), 0);
+
+                let first = super::HitboxId(1);
+                window.capture_pointer(first);
+                assert_eq!(window.captured_hitbox(), Some(first));
+                window.release_pointer();
+                assert_eq!(window.captured_hitbox(), None);
+                assert_eq!(
+                    platform_window.pointer_capture_release_count(),
+                    1,
+                    "cancellation must reach the platform without MouseUp"
+                );
+
+                window.release_pointer();
+                assert_eq!(platform_window.pointer_capture_release_count(), 1);
+
+                let fresh = super::HitboxId(2);
+                window.capture_pointer(fresh);
+                assert_eq!(window.captured_hitbox(), Some(fresh));
+                assert_eq!(platform_window.pointer_capture_release_count(), 1);
+                window.release_pointer();
+                assert_eq!(window.captured_hitbox(), None);
+                assert_eq!(platform_window.pointer_capture_release_count(), 2);
+            })
+            .unwrap();
     }
 
     #[gpui::test]
