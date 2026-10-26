@@ -22,6 +22,7 @@ use windows::{
         Graphics::{Dwm::*, Gdi::*},
         System::{
             Com::*, Diagnostics::Debug::MessageBeep, LibraryLoader::*, Ole::*, SystemServices::*,
+            Threading::GetCurrentThreadId,
         },
         UI::{Controls::*, HiDpi::*, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
     },
@@ -813,6 +814,35 @@ impl PlatformWindow for WindowsWindow {
             point
         };
         logical_point(point.x as f32, point.y as f32, scale_factor)
+    }
+
+    fn release_pointer_capture(&self) {
+        let this = &self.0;
+        // WM_DESTROY marks this owner before Windows can reuse its HWND. Poisoned
+        // platforms retain no authority to call into their former native windows.
+        if this.destroyed.get() || this.poisoned.get() {
+            return;
+        }
+        // SAFETY: read-only query of this owner's HWND, with no process-id output.
+        let owner_thread = unsafe { GetWindowThreadProcessId(this.hwnd, None) };
+        // SAFETY: returns the calling thread's id without accessing window state.
+        let current_thread = unsafe { GetCurrentThreadId() };
+        if owner_thread == 0 || owner_thread != current_thread {
+            return;
+        }
+        // SAFETY: read-only query of this UI thread's current capture owner.
+        if unsafe { GetCapture() } != this.hwnd {
+            return;
+        }
+        // SAFETY: this Rc keeps the native owner alive. Its HWND is not destroyed
+        // or poisoned, belongs to this thread, and owns capture. The queries above
+        // make no application callout. This operation borrows no callback or
+        // renderer across ReleaseCapture's synchronous capture-change notification.
+        unsafe {
+            ReleaseCapture()
+                .context("unable to release pointer capture")
+                .log_err();
+        }
     }
 
     fn modifiers(&self) -> Modifiers {

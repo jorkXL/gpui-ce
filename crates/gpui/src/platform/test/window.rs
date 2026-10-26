@@ -40,6 +40,7 @@ pub(crate) struct TestWindowState {
     appearance_change_callback: Option<Box<dyn FnMut()>>,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     frame_wake_count: Rc<Cell<usize>>,
+    pointer_capture_release_count: usize,
     frame_scheduled: bool,
     frame_callback_pending: bool,
     input_handler: Option<PlatformInputHandler>,
@@ -105,6 +106,7 @@ impl TestWindow {
             appearance_change_callback: None,
             request_frame_callback: None,
             frame_wake_count: Rc::new(Cell::new(0)),
+            pointer_capture_release_count: 0,
             frame_scheduled: false,
             frame_callback_pending: false,
             input_handler: None,
@@ -188,6 +190,11 @@ impl TestWindow {
         self.0.lock().appearance_change_callback = Some(callback);
     }
 
+    /// Number of native pointer-capture release requests received by this window.
+    pub fn pointer_capture_release_count(&self) -> usize {
+        self.0.lock().pointer_capture_release_count
+    }
+
     /// Returns how many times this window's frame waker has been invoked.
     pub fn frame_wake_count(&self) -> usize {
         self.0.lock().frame_wake_count.get()
@@ -261,6 +268,10 @@ impl PlatformWindow for TestWindow {
 
     fn mouse_position(&self) -> Point<Pixels> {
         Point::default()
+    }
+
+    fn release_pointer_capture(&self) {
+        self.0.lock().pointer_capture_release_count += 1;
     }
 
     fn modifiers(&self) -> crate::Modifiers {

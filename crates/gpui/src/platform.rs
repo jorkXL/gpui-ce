@@ -881,6 +881,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn appearance(&self) -> WindowAppearance;
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>>;
     fn mouse_position(&self) -> Point<Pixels>;
+    /// Relinquishes explicit native pointer capture if this live window owns it.
+    /// GPUI has already cleared the captured hitbox. Platforms without explicit
+    /// native capture need no operation.
+    fn release_pointer_capture(&self) {}
+
     fn modifiers(&self) -> Modifiers;
     fn capslock(&self) -> Capslock;
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler);
