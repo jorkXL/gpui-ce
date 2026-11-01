@@ -235,3 +235,61 @@ fn windows_default_renderer_has_no_wgpu_path() {
         window_path.display()
     );
 }
+
+/// DirectX draws paths through `_UNORM_SRGB` views so their edges blend in linear light.
+/// Every other primitive must keep its UNORM views and look as before, so only the path
+/// pass and the code that makes the views may reach them.
+#[test]
+fn directx_srgb_views_reach_only_the_path_pass() {
+    let source = std::fs::read_to_string(
+        workspace_root().join("crates/gpui_windows/src/directx_renderer.rs"),
+    )
+    .expect("read the DirectX renderer");
+    let code: String = source
+        .lines()
+        .map(|line| line.split("//").next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let allowed = [
+        "draw_paths_to_intermediate",
+        "draw_paths_from_intermediate",
+        "new",
+        "create_render_target_linear_view",
+        "recreate_resources",
+        "resize",
+        "linear_view_of",
+        "ensure_isolated_targets",
+        "create_color_target",
+        "linear_paths_supported",
+        // `ShaderModule::shader` names the linear shader, not a view.
+        "shader",
+    ];
+    let markers = [
+        "LINEAR_PATH_FORMAT",
+        "linear_view_of(",
+        "render_target_linear_view",
+        "scene_color_linear_rtv",
+        "group_linear_rtvs",
+        "path.linear",
+        "PathRasterizationLinear",
+    ];
+    let offenders: Vec<&str> = code
+        .split("fn ")
+        .skip(1)
+        // A function's text ends where the next item that is not a function starts.
+        .map(|body| {
+            ["enum ", "struct ", "mod "]
+                .iter()
+                .filter_map(|item| body.find(item))
+                .min()
+                .map_or(body, |end| &body[..end])
+        })
+        .filter(|body| markers.iter().any(|marker| body.contains(marker)))
+        .map(|body| body.split(['(', '<']).next().unwrap_or(body).trim())
+        .filter(|name| !allowed.contains(name))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "only the path pass may use the linear path views, but these functions do: {offenders:?}"
+    );
+}

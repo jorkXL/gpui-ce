@@ -246,3 +246,48 @@ fn linear_gradients_preserve_native_dithering() {
 
     assert_ne!(first.w, second.w);
 }
+
+/// What a `_UNORM_SRGB` render target stores after blending premultiplied `source` over
+/// `stored` (ONE / INV_SRC_ALPHA): it decodes, blends in linear light, encodes and rounds.
+fn blend_through_srgb_view(source: wgsl_rs::std::Vec4f, stored: f32) -> f32 {
+    use common::*;
+    use wgsl_rs::std::*;
+    let blended = source.x + srgb_to_linear(vec3f(stored, stored, stored)).x * (1.0 - source.w);
+    (linear_to_srgb(vec3f(blended, blended, blended)).x * 255.0).round() / 255.0
+}
+
+#[test]
+fn linear_path_output_keeps_opaque_colours_and_mixes_edges_in_light() {
+    use common::*;
+    use path_rasterization::premultiply_linear;
+    use wgsl_rs::std::*;
+
+    // A fully covered opaque path lands on its own 8-bit value over any destination.
+    for value in 0..=255u8 {
+        let encoded = f32::from(value) / 255.0;
+        let source = premultiply_linear(vec4f(encoded, encoded, encoded, 1.0), 1.0);
+        for stored in [0.0, 0.5, 1.0] {
+            assert_eq!(blend_through_srgb_view(source, stored), encoded, "{value}");
+        }
+    }
+
+    // A white edge split over two pixels at coverage c and 1 - c, over black: in linear
+    // light the pair shows one pixel of white wherever the edge falls. Blended as encoded
+    // values (the UNORM view), half coverage shows 21% of white's light, not 50%.
+    let light = |encoded: f32| srgb_to_linear(vec3f(encoded, encoded, encoded)).x;
+    for step in 0..=16 {
+        let coverage = step as f32 / 16.0;
+        let pair: f32 = [coverage, 1.0 - coverage]
+            .map(|c| {
+                light(blend_through_srgb_view(
+                    premultiply_linear(vec4f(1.0, 1.0, 1.0, 1.0), c),
+                    0.0,
+                ))
+            })
+            .iter()
+            .sum();
+        assert!((pair - 1.0).abs() < 0.01, "coverage {coverage}: {pair}");
+    }
+    let encoded_half = premultiply(vec4f(1.0, 1.0, 1.0, 1.0), 0.5).x;
+    assert!((2.0 * light(encoded_half) - 0.43).abs() < 0.01);
+}
