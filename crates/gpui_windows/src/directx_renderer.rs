@@ -168,10 +168,15 @@ impl PathResources {
         let (msaa_texture, msaa_view) =
             create_path_intermediate_msaa_texture_and_view(device, width, height, storage)?;
         let linear = if linear {
-            Some(LinearPathViews {
-                srv: create_texture_view(device, &texture, LINEAR_PATH_FORMAT)?,
-                msaa_view: create_target_view(device, &msaa_texture, LINEAR_PATH_FORMAT, true)?,
-            })
+            let srv = create_texture_view(device, &texture, LINEAR_PATH_FORMAT);
+            let msaa_view = create_target_view(device, &msaa_texture, LINEAR_PATH_FORMAT, true);
+            match (srv, msaa_view) {
+                (Ok(srv), Ok(msaa_view)) => Some(LinearPathViews { srv, msaa_view }),
+                (Err(error), _) | (_, Err(error)) => {
+                    log_gamma_fallback("the path textures", &error);
+                    None
+                }
+            }
         } else {
             None
         };
@@ -195,8 +200,8 @@ struct BlurResources {
     scene_color: ID3D11Texture2D,
     scene_color_rtv: Option<ID3D11RenderTargetView>,
     scene_color_srv: Option<ID3D11ShaderResourceView>,
-    // `LINEAR_PATH_FORMAT` views of `scene_color` and `groups`, which paths composite onto,
-    // when paths blend in linear light.
+    // `scene_color`'s `LINEAR_PATH_FORMAT` view, which paths composite onto, when paths blend
+    // in linear light.
     scene_color_linear_rtv: Option<ID3D11RenderTargetView>,
     #[expect(dead_code)]
     ping: ID3D11Texture2D,
@@ -206,11 +211,13 @@ struct BlurResources {
     pong: ID3D11Texture2D,
     pong_rtv: Option<ID3D11RenderTargetView>,
     pong_srv: Option<ID3D11ShaderResourceView>,
-    // Kept alive for the lifetime of their views; indexed by isolation depth.
+    // Kept alive for the lifetime of their views; indexed by isolation depth. A group starts
+    // transparent and is composited through its UNORM view as gamma-premultiplied colour, so
+    // it has no `LINEAR_PATH_FORMAT` view: a translucent path stored there in linear light
+    // would read back as another colour. Paths in a group blend in gamma space.
     groups: Vec<ID3D11Texture2D>,
     group_rtvs: Vec<Option<ID3D11RenderTargetView>>,
     group_srvs: Vec<Option<ID3D11ShaderResourceView>>,
-    group_linear_rtvs: Vec<Option<ID3D11RenderTargetView>>,
 }
 
 impl BlurResources {
@@ -242,9 +249,8 @@ impl BlurResources {
             groups: Vec::with_capacity(isolated_target_count),
             group_rtvs: Vec::with_capacity(isolated_target_count),
             group_srvs: Vec::with_capacity(isolated_target_count),
-            group_linear_rtvs: Vec::with_capacity(isolated_target_count),
         };
-        blur.ensure_isolated_targets(device, width, height, isolated_target_count, linear_paths)?;
+        blur.ensure_isolated_targets(device, width, height, isolated_target_count)?;
         Ok(blur)
     }
 
@@ -254,15 +260,13 @@ impl BlurResources {
         width: u32,
         height: u32,
         isolated_target_count: usize,
-        linear_paths: bool,
     ) -> Result<()> {
         while self.groups.len() < isolated_target_count {
-            let (group, group_rtv, group_srv, group_linear_rtv) =
-                create_color_target(device, width, height, linear_paths)?;
+            let (group, group_rtv, group_srv, _) =
+                create_color_target(device, width, height, false)?;
             self.groups.push(group);
             self.group_rtvs.push(group_rtv);
             self.group_srvs.push(group_srv);
-            self.group_linear_rtvs.push(group_linear_rtv);
         }
         Ok(())
     }
@@ -1653,13 +1657,17 @@ impl DirectXResources {
         match view {
             Ok(view) => self.render_target_linear_view = view,
             Err(error) => {
-                log::warn!(
-                    "Paths blend in gamma space: the swap chain refused a B8G8R8A8_UNORM_SRGB view: {error:#}"
-                );
-                self.linear_paths = false;
-                self.render_target_linear_view = None;
+                log_gamma_fallback("the swap chain", &error);
+                self.disable_linear_paths();
             }
         }
+    }
+
+    /// Paths blend in gamma space from now on, through the UNORM views every target has,
+    /// after a `LINEAR_PATH_FORMAT` view could not be made.
+    fn disable_linear_paths(&mut self) {
+        self.linear_paths = false;
+        self.render_target_linear_view = None;
     }
 
     /// The `LINEAR_PATH_FORMAT` view of the texture `target` views, if it has one.
@@ -1678,8 +1686,8 @@ impl DirectXResources {
         if same(&blur.scene_color_rtv) {
             return blur.scene_color_linear_rtv.clone();
         }
-        let group = blur.group_rtvs.iter().position(same)?;
-        blur.group_linear_rtvs.get(group)?.clone()
+        // Groups have none: see `BlurResources::groups`.
+        None
     }
 
     #[inline]
@@ -1708,13 +1716,17 @@ impl DirectXResources {
         isolated_target_count: usize,
     ) -> Result<()> {
         if self.blur.is_none() {
-            self.blur = Some(BlurResources::new(
+            let blur = BlurResources::new(
                 device,
                 self.viewport.Width as u32,
                 self.viewport.Height as u32,
                 isolated_target_count,
                 self.linear_paths,
-            )?);
+            )?;
+            if blur.scene_color_linear_rtv.is_none() {
+                self.disable_linear_paths();
+            }
+            self.blur = Some(blur);
         }
         let blur = self
             .blur
@@ -1725,18 +1737,21 @@ impl DirectXResources {
             self.viewport.Width as u32,
             self.viewport.Height as u32,
             isolated_target_count,
-            self.linear_paths,
         )
     }
 
     fn ensure_path_resources(&mut self, device: &ID3D11Device) -> Result<()> {
         if self.path.is_none() {
-            self.path = Some(PathResources::new(
+            let resources = PathResources::new(
                 device,
                 self.viewport.Width as u32,
                 self.viewport.Height as u32,
                 self.linear_paths,
-            )?);
+            )?;
+            if resources.linear.is_none() {
+                self.disable_linear_paths();
+            }
+            self.path = Some(resources);
         }
         Ok(())
     }
@@ -2384,7 +2399,10 @@ fn create_color_target(
     let rtv = create_target_view(device, &texture, RENDER_TARGET_FORMAT, false)?;
     let srv = create_texture_view(device, &texture, RENDER_TARGET_FORMAT)?;
     let linear_rtv = if linear_paths {
-        create_target_view(device, &texture, LINEAR_PATH_FORMAT, false)?
+        create_target_view(device, &texture, LINEAR_PATH_FORMAT, false).unwrap_or_else(|error| {
+            log_gamma_fallback("an offscreen target", &error);
+            None
+        })
     } else {
         None
     };
@@ -2440,6 +2458,11 @@ fn create_texture_view(
     let mut view = None;
     unsafe { device.CreateShaderResourceView(texture, Some(&desc), Some(&mut view))? };
     Ok(view)
+}
+
+/// Logs that paths blend in gamma space because `what` refused a `LINEAR_PATH_FORMAT` view.
+fn log_gamma_fallback(what: &str, error: &anyhow::Error) {
+    log::warn!("Paths blend in gamma space: {what} refused a B8G8R8A8_UNORM_SRGB view: {error:#}");
 }
 
 /// Whether the device can draw paths through `LINEAR_PATH_FORMAT`: sample it and render,
