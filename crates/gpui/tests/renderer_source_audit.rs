@@ -259,7 +259,6 @@ fn directx_srgb_views_reach_only_the_path_pass() {
         "resize",
         "linear_view_of",
         "disable_linear_paths",
-        "create_color_target",
         "linear_paths_supported",
         // `ShaderModule::shader` names the linear shader, not a view.
         "shader",
@@ -268,7 +267,6 @@ fn directx_srgb_views_reach_only_the_path_pass() {
         "LINEAR_PATH_FORMAT",
         "linear_view_of(",
         "render_target_linear_view",
-        "scene_color_linear_rtv",
         "path.linear",
         "PathRasterizationLinear",
     ];
