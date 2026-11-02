@@ -44,6 +44,14 @@ use gpui::*;
 
 pub(crate) const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSITION";
 const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
+/// The view paths draw and composite through when the device supports it: the hardware
+/// decodes the destination, blends in linear light and encodes again, so anti-aliased path
+/// edges mix light rather than encoded values. Every other primitive keeps
+/// `RENDER_TARGET_FORMAT` views and blends as before.
+const LINEAR_PATH_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+/// The storage of a texture that has both a `RENDER_TARGET_FORMAT` and a `LINEAR_PATH_FORMAT`
+/// view.
+const TYPELESS_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_TYPELESS;
 // This configuration is used for MSAA rendering on paths only, and it's guaranteed to be supported by DirectX 11.
 const PATH_MULTISAMPLE_COUNT: u32 = 4;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
@@ -77,6 +85,10 @@ pub(crate) struct DirectXRenderer {
     width: u32,
     height: u32,
 
+    /// Whether linear paths failed on a device this renderer used (see
+    /// `DirectXResources::linear_failed`): a device made after a loss does not try them again.
+    linear_failed: bool,
+
     /// Whether we want to skip drawing due to device lost events.
     ///
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
@@ -109,6 +121,20 @@ struct DirectXResources {
     render_target: Option<ID3D11Texture2D>,
     render_target_view: Option<ID3D11RenderTargetView>,
 
+    // Whether paths blend in linear light (`LINEAR_PATH_FORMAT`): the device supports the
+    // format, linear paths never failed on this renderer, and the linear path shader and
+    // every target set made so far took their sRGB views. Once it is false, it stays false.
+    linear_paths: bool,
+    // Whether linear paths were on and then failed, so a device made after a loss does not
+    // try them again or log the fallback again.
+    linear_failed: bool,
+    // The swap chain buffer's `LINEAR_PATH_FORMAT` view, while `linear_paths`.
+    render_target_linear_view: Option<ID3D11RenderTargetView>,
+    // Whether the frame being drawn has an opaque background. A transparent window's buffer
+    // is composited as gamma-premultiplied colour, as a filter group is (see
+    // `BlurResources::groups`), so paths over it blend in gamma space.
+    opaque: bool,
+
     // Path intermediates are absent until a scene contains a path batch.
     path: Option<PathResources>,
 
@@ -134,18 +160,41 @@ struct PathResources {
     srv: Option<ID3D11ShaderResourceView>,
     msaa_texture: ID3D11Texture2D,
     msaa_view: Option<ID3D11RenderTargetView>,
+    // The same textures' `LINEAR_PATH_FORMAT` views, when they were made for linear paths.
+    linear: Option<LinearPathViews>,
+}
+
+struct LinearPathViews {
+    srv: Option<ID3D11ShaderResourceView>,
+    msaa_view: Option<ID3D11RenderTargetView>,
 }
 
 impl PathResources {
-    fn new(device: &ID3D11Device, width: u32, height: u32) -> Result<Self> {
-        let (texture, srv) = create_path_intermediate_texture(device, width, height)?;
+    /// With `linear`, typeless textures with `LINEAR_PATH_FORMAT` views besides their UNORM
+    /// ones. Any step that fails fails the whole set (see `with_linear_fallback`).
+    fn new(device: &ID3D11Device, width: u32, height: u32, linear: bool) -> Result<Self> {
+        let storage = if linear {
+            TYPELESS_TARGET_FORMAT
+        } else {
+            RENDER_TARGET_FORMAT
+        };
+        let (texture, srv) = create_path_intermediate_texture(device, width, height, storage)?;
         let (msaa_texture, msaa_view) =
-            create_path_intermediate_msaa_texture_and_view(device, width, height)?;
+            create_path_intermediate_msaa_texture_and_view(device, width, height, storage)?;
+        let linear = if linear {
+            Some(LinearPathViews {
+                srv: create_texture_view(device, &texture, LINEAR_PATH_FORMAT)?,
+                msaa_view: create_target_view(device, &msaa_texture, LINEAR_PATH_FORMAT, true)?,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             texture,
             srv,
             msaa_texture,
             msaa_view,
+            linear,
         })
     }
 }
@@ -160,6 +209,8 @@ struct BlurResources {
     scene_color: ID3D11Texture2D,
     scene_color_rtv: Option<ID3D11RenderTargetView>,
     scene_color_srv: Option<ID3D11ShaderResourceView>,
+    // `scene_color` starts transparent and is blitted as gamma-premultiplied colour, as a
+    // group is, so it has no `LINEAR_PATH_FORMAT` view either.
     #[expect(dead_code)]
     ping: ID3D11Texture2D,
     ping_rtv: Option<ID3D11RenderTargetView>,
@@ -168,7 +219,10 @@ struct BlurResources {
     pong: ID3D11Texture2D,
     pong_rtv: Option<ID3D11RenderTargetView>,
     pong_srv: Option<ID3D11ShaderResourceView>,
-    // Kept alive for the lifetime of their views; indexed by isolation depth.
+    // Kept alive for the lifetime of their views; indexed by isolation depth. A group starts
+    // transparent and is composited through its UNORM view as gamma-premultiplied colour, so
+    // it has no `LINEAR_PATH_FORMAT` view: a translucent path stored there in linear light
+    // would read back as another colour. Paths in a group blend in gamma space.
     groups: Vec<ID3D11Texture2D>,
     group_rtvs: Vec<Option<ID3D11RenderTargetView>>,
     group_srvs: Vec<Option<ID3D11ShaderResourceView>>,
@@ -348,12 +402,16 @@ impl DirectXRenderer {
             .context("Creating DirectX devices")?;
         let atlas = Arc::new(DirectXAtlas::new(&devices.device, &devices.device_context));
 
-        let resources = DirectXResources::new(&devices, 1, 1, hwnd, disable_direct_composition)
-            .context("Creating DirectX resources")?;
+        let mut resources =
+            DirectXResources::new(&devices, 1, 1, hwnd, disable_direct_composition, false)
+                .context("Creating DirectX resources")?;
         let globals = DirectXGlobalElements::new(&devices.device)
             .context("Creating DirectX global elements")?;
-        let pipelines = DirectXRenderPipelines::new(&devices.device)
+        let pipelines = DirectXRenderPipelines::new(&devices.device, resources.linear_paths)
             .context("Creating DirectX render pipelines")?;
+        if !pipelines.has_linear_path_shader() {
+            resources.disable_linear_paths();
+        }
 
         let direct_composition = if disable_direct_composition {
             None
@@ -377,6 +435,7 @@ impl DirectXRenderer {
             font_info: Self::get_font_info(),
             width: 1,
             height: 1,
+            linear_failed: false,
             skip_draws: false,
             active_render_target: None,
             path_rasterization_vertices: Vec::new(),
@@ -467,6 +526,10 @@ impl DirectXRenderer {
                     .log_err();
             }
 
+            self.linear_failed |= self
+                .resources
+                .as_ref()
+                .is_some_and(|resources| resources.linear_failed);
             self.resources.take();
             if let Some(devices) = &self.devices {
                 devices.device_context.OMSetRenderTargets(None, None);
@@ -484,18 +547,22 @@ impl DirectXRenderer {
 
         let devices = DirectXRendererDevices::new(directx_devices, disable_direct_composition)
             .context("Recreating DirectX devices")?;
-        let resources = DirectXResources::new(
+        let mut resources = DirectXResources::new(
             &devices,
             self.width,
             self.height,
             self.hwnd,
             disable_direct_composition,
+            self.linear_failed,
         )
         .context("Creating DirectX resources")?;
         let globals = DirectXGlobalElements::new(&devices.device)
             .context("Creating DirectXGlobalElements")?;
-        let pipelines = DirectXRenderPipelines::new(&devices.device)
+        let pipelines = DirectXRenderPipelines::new(&devices.device, resources.linear_paths)
             .context("Creating DirectXRenderPipelines")?;
+        if !pipelines.has_linear_path_shader() {
+            resources.disable_linear_paths();
+        }
 
         let direct_composition = if disable_direct_composition {
             None
@@ -557,6 +624,7 @@ impl DirectXRenderer {
         let requirements = scene.render_plan().requirements();
         let device = &self.devices.as_ref().context("devices missing")?.device;
         let resources = self.resources.as_mut().context("resources missing")?;
+        resources.opaque = matches!(background_appearance, WindowBackgroundAppearance::Opaque);
         resources.retain_surface_views(&scene.surfaces);
         if requirements.uses_path_target {
             resources.ensure_path_resources(device)?;
@@ -652,8 +720,9 @@ impl DirectXRenderer {
                         continue;
                     }
                     let paths = &scene.paths[range.clone()];
-                    self.draw_paths_to_intermediate(paths, *rasterization_vertex_count)?;
-                    self.draw_paths_from_intermediate(paths, *sprite_count)
+                    let linear =
+                        self.draw_paths_to_intermediate(paths, *rasterization_vertex_count)?;
+                    self.draw_paths_from_intermediate(paths, *sprite_count, linear)
                 }
                 RenderCommand::Batch(PrimitiveBatch::Underlines(range)) => {
                     self.draw_underlines(instance_range(range)?)
@@ -875,6 +944,7 @@ impl DirectXRenderer {
         let resources = self.resources.as_mut().context("resources missing")?;
         resources.render_target.take();
         resources.render_target_view.take();
+        resources.render_target_linear_view.take();
 
         // Resizing the swap chain requires a call to the underlying DXGI adapter, which can return the device removed error.
         // The app might have moved to a monitor that's attached to a different graphics device.
@@ -993,13 +1063,16 @@ impl DirectXRenderer {
         )
     }
 
+    /// Rasterizes `paths` into the path intermediate and binds the target their composite
+    /// draws onto. Returns whether the batch blends in linear light: the device supports it
+    /// and the active target has a `LINEAR_PATH_FORMAT` view.
     fn draw_paths_to_intermediate(
         &mut self,
         paths: &[Path<ScaledPixels>],
         rasterization_vertex_count: usize,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if paths.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
         self.path_rasterization_vertices.clear();
@@ -1025,16 +1098,31 @@ impl DirectXRenderer {
             .path
             .as_ref()
             .context("path resources were not prepared")?;
+        // The active render target: the offscreen scene/group target when blurring, otherwise
+        // the swapchain.
+        let target = if self.active_render_target.is_some() {
+            &self.active_render_target
+        } else {
+            &resources.render_target_view
+        };
+        let linear = path
+            .linear
+            .as_ref()
+            .and_then(|views| Some((views, Some(resources.linear_view_of(target.as_ref()?)?))));
+        let (msaa_view, resolve_format) = match linear {
+            Some((views, _)) => (&views.msaa_view, LINEAR_PATH_FORMAT),
+            None => (&path.msaa_view, RENDER_TARGET_FORMAT),
+        };
         // Clear intermediate MSAA texture
         unsafe {
             devices.device_context.ClearRenderTargetView(
-                path.msaa_view.as_ref().context("path MSAA view missing")?,
+                msaa_view.as_ref().context("path MSAA view missing")?,
                 &[0.0; 4],
             );
             // Set intermediate MSAA texture as render target
             devices
                 .device_context
-                .OMSetRenderTargets(Some(slice::from_ref(&path.msaa_view)), None);
+                .OMSetRenderTargets(Some(slice::from_ref(msaa_view)), None);
         }
 
         self.pipelines.path_rasterization_pipeline.update_buffer(
@@ -1042,40 +1130,46 @@ impl DirectXRenderer {
             &devices.device_context,
             &self.path_rasterization_vertices,
         )?;
+        // The linear variant outputs linear-light colour for the `LINEAR_PATH_FORMAT` view.
         self.pipelines.path_rasterization_pipeline.draw_vertices(
             &self.frame_bindings()?,
             u32::try_from(rasterization_vertex_count)
                 .context("path rasterization vertex count exceeds the D3D11 draw limit")?,
+            linear.is_some(),
         )?;
 
-        // Resolve MSAA to non-MSAA intermediate texture
+        // Resolve MSAA to non-MSAA intermediate texture. Through `LINEAR_PATH_FORMAT` the
+        // samples average in linear light.
         unsafe {
             devices.device_context.ResolveSubresource(
                 &path.texture,
                 0,
                 &path.msaa_texture,
                 0,
-                RENDER_TARGET_FORMAT,
+                resolve_format,
             );
-            // Restore the active render target (the offscreen scene/group target when blurring,
-            // otherwise the swapchain) so the path sprites land on the correct surface.
-            let restore_target = if self.active_render_target.is_some() {
-                &self.active_render_target
-            } else {
-                &resources.render_target_view
+            // Bind the active render target so the path sprites land on the correct surface,
+            // through its `LINEAR_PATH_FORMAT` view when the batch blends in linear light.
+            let composite_target = match &linear {
+                Some((_, view)) => view,
+                None => target,
             };
             devices
                 .device_context
-                .OMSetRenderTargets(Some(slice::from_ref(restore_target)), None);
+                .OMSetRenderTargets(Some(slice::from_ref(composite_target)), None);
         }
 
-        Ok(())
+        Ok(linear.is_some())
     }
 
+    /// Composites the path intermediate onto the target `draw_paths_to_intermediate` bound,
+    /// through the `LINEAR_PATH_FORMAT` views when it returned `linear`, then binds the active
+    /// target's own view again.
     fn draw_paths_from_intermediate(
         &mut self,
         paths: &[Path<ScaledPixels>],
         sprite_count: usize,
+        linear: bool,
     ) -> Result<()> {
         let Some(first_path) = paths.first() else {
             return Ok(());
@@ -1117,11 +1211,33 @@ impl DirectXRenderer {
         )?;
         let instances = InstanceRange::from_start(sprite_count)
             .context("path sprite count exceeds the D3D11 instance limit")?;
-        self.pipelines.path_sprite_pipeline.draw_instances(
+        let srv = if linear {
+            &path
+                .linear
+                .as_ref()
+                .context("linear path views missing")?
+                .srv
+        } else {
+            &path.srv
+        };
+        let result = self.pipelines.path_sprite_pipeline.draw_instances(
             &self.frame_bindings()?,
-            Some(slice::from_ref(&path.srv)),
+            Some(slice::from_ref(srv)),
             instances,
-        )
+        );
+        if linear {
+            let target = if self.active_render_target.is_some() {
+                &self.active_render_target
+            } else {
+                &resources.render_target_view
+            };
+            unsafe {
+                devices
+                    .device_context
+                    .OMSetRenderTargets(Some(slice::from_ref(target)), None);
+            }
+        }
+        result
     }
 
     fn draw_underlines(&mut self, instances: InstanceRange) -> Result<()> {
@@ -1515,6 +1631,7 @@ impl DirectXResources {
         height: u32,
         hwnd: HWND,
         disable_direct_composition: bool,
+        linear_failed: bool,
     ) -> Result<Self> {
         let swap_chain = if disable_direct_composition {
             create_swap_chain(&devices.dxgi_factory, &devices.device, hwnd, width, height)?
@@ -1530,15 +1647,93 @@ impl DirectXResources {
         let (render_target, render_target_view, viewport) =
             create_resources(devices, &swap_chain, width, height)?;
         set_rasterizer_state(&devices.device, &devices.device_context)?;
-        Ok(Self {
+        // After a failure the fallback line was logged already.
+        let linear_paths = !linear_failed && linear_paths_supported(&devices.device);
+        if !linear_failed && !linear_paths {
+            log::warn!(
+                "Paths blend in gamma space: the device lacks render-target, blend, 4x MSAA, \
+                 resolve or sampling support for B8G8R8A8_UNORM_SRGB"
+            );
+        }
+        let mut resources = Self {
             swap_chain,
             render_target: Some(render_target),
             render_target_view,
+            linear_paths,
+            linear_failed,
+            render_target_linear_view: None,
+            opaque: true,
             path: None,
             blur: None,
             surface_views: FxHashMap::default(),
             viewport,
-        })
+        };
+        resources.create_render_target_linear_view(&devices.device);
+        Ok(resources)
+    }
+
+    /// Makes the swap chain buffer's `LINEAR_PATH_FORMAT` view while paths blend in linear
+    /// light. If the swap chain refuses it, paths blend in gamma space from then on.
+    fn create_render_target_linear_view(&mut self, device: &ID3D11Device) {
+        if !self.linear_paths {
+            return;
+        }
+        let view = self
+            .render_target
+            .as_ref()
+            .context("render target missing")
+            .and_then(|target| create_target_view(device, target, LINEAR_PATH_FORMAT, false));
+        match view {
+            Ok(view) => self.render_target_linear_view = view,
+            Err(error) => {
+                log_gamma_fallback("the swap chain", &error);
+                self.disable_linear_paths();
+            }
+        }
+    }
+
+    /// Paths blend in gamma space from now on, through the UNORM views every target has,
+    /// after a `LINEAR_PATH_FORMAT` view could not be made.
+    fn disable_linear_paths(&mut self) {
+        self.linear_failed |= self.linear_paths;
+        self.linear_paths = false;
+        self.render_target_linear_view = None;
+    }
+
+    /// Makes a target set with `build`, for linear paths while they are on. If any step of
+    /// that fails, paths blend in gamma space from then on and the set is made again with
+    /// UNORM storage, so linear paths never cost a frame.
+    fn with_linear_fallback<T>(
+        &mut self,
+        what: &str,
+        build: impl Fn(bool) -> Result<T>,
+    ) -> Result<T> {
+        if self.linear_paths {
+            match build(true) {
+                Ok(built) => return Ok(built),
+                Err(error) => {
+                    log_gamma_fallback(what, &error);
+                    self.disable_linear_paths();
+                }
+            }
+        }
+        build(false)
+    }
+
+    /// The `LINEAR_PATH_FORMAT` view of the texture `target` views, if paths may blend in
+    /// linear light on it: only on the swap chain, on an opaque frame. The offscreen scene
+    /// and the filter groups start transparent and are composited as gamma-premultiplied
+    /// colour (see `BlurResources`), as a transparent window's buffer is.
+    fn linear_view_of(&self, target: &ID3D11RenderTargetView) -> Option<ID3D11RenderTargetView> {
+        let swap_chain = self
+            .render_target_view
+            .as_ref()
+            .is_some_and(|view| view.as_raw() == target.as_raw());
+        if self.linear_paths && self.opaque && swap_chain {
+            self.render_target_linear_view.clone()
+        } else {
+            None
+        }
     }
 
     #[inline]
@@ -1552,6 +1747,7 @@ impl DirectXResources {
             create_resources(devices, &self.swap_chain, width, height)?;
         self.render_target = Some(render_target);
         self.render_target_view = render_target_view;
+        self.create_render_target_linear_view(&devices.device);
         // Intermediate textures are size-dependent and recreated lazily if a later scene needs
         // them. Ordinary scenes therefore pay neither the allocation nor resize cost.
         self.path = None;
@@ -1587,11 +1783,11 @@ impl DirectXResources {
 
     fn ensure_path_resources(&mut self, device: &ID3D11Device) -> Result<()> {
         if self.path.is_none() {
-            self.path = Some(PathResources::new(
-                device,
-                self.viewport.Width as u32,
-                self.viewport.Height as u32,
-            )?);
+            let (width, height) = (self.viewport.Width as u32, self.viewport.Height as u32);
+            let resources = self.with_linear_fallback("the path textures", |linear| {
+                PathResources::new(device, width, height, linear)
+            })?;
+            self.path = Some(resources);
         }
         Ok(())
     }
@@ -1612,7 +1808,14 @@ impl DirectXResources {
 }
 
 impl DirectXRenderPipelines {
-    pub fn new(device: &ID3D11Device) -> Result<Self> {
+    /// Whether the linear path shader was made, so paths may blend in linear light.
+    fn has_linear_path_shader(&self) -> bool {
+        self.path_rasterization_pipeline.variant.is_some()
+    }
+
+    /// With `linear_paths`, also makes the linear path shader. If that fails, it logs the
+    /// fallback line and paths keep the gamma shader (see `has_linear_path_shader`).
+    pub fn new(device: &ID3D11Device, linear_paths: bool) -> Result<Self> {
         let shadow_pipeline = PipelineState::new(
             device,
             "shadow_pipeline",
@@ -1629,13 +1832,19 @@ impl DirectXRenderPipelines {
             create_blend_state(device)?,
         )?
         .with_variant(device, ShaderModule::SmoothedQuad)?;
-        let path_rasterization_pipeline = PipelineState::new(
+        let mut path_rasterization_pipeline = PipelineState::new(
             device,
             "path_rasterization_pipeline",
             ShaderModule::PathRasterization,
             32,
             create_blend_state_for_path_rasterization(device)?,
         )?;
+        if linear_paths
+            && let Err(error) = path_rasterization_pipeline
+                .add_variant(device, ShaderModule::PathRasterizationLinear)
+        {
+            log_gamma_fallback("the linear path shader", &error);
+        }
         let path_sprite_pipeline = PipelineState::new(
             device,
             "path_sprite_pipeline",
@@ -1846,6 +2055,12 @@ impl<T> PipelineState<T> {
     }
 
     fn with_variant(mut self, device: &ID3D11Device, shader_module: ShaderModule) -> Result<Self> {
+        self.add_variant(device, shader_module)?;
+        Ok(self)
+    }
+
+    /// Makes `shader_module` this pipeline's variant. On failure it has none.
+    fn add_variant(&mut self, device: &ID3D11Device, shader_module: ShaderModule) -> Result<()> {
         let shader = shader_module.shader();
         let bytecode = shader_module.bytecode()?;
         anyhow::ensure!(
@@ -1871,7 +2086,7 @@ impl<T> PipelineState<T> {
             vertex: create_vertex_shader(device, bytecode.vertex)?,
             fragment: create_fragment_shader(device, bytecode.fragment)?,
         });
-        Ok(self)
+        Ok(())
     }
 
     fn update_buffer(
@@ -1958,14 +2173,28 @@ impl<T> PipelineState<T> {
         self.draw_with_variant(frame, texture, vertex_count, instances, variant)
     }
 
-    /// Draws `vertex_count` vertex-pulled vertices as a single instance.
-    fn draw_vertices(&self, frame: &FrameBindings<'_>, vertex_count: u32) -> Result<()> {
+    /// Draws `vertex_count` vertex-pulled vertices as a single instance, with the variant's
+    /// shaders when `use_variant`.
+    fn draw_vertices(
+        &self,
+        frame: &FrameBindings<'_>,
+        vertex_count: u32,
+        use_variant: bool,
+    ) -> Result<()> {
+        let variant = use_variant.then(|| {
+            self.variant
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} has no shader variant", self.label))
+        });
+        let specification = variant
+            .map(|variant| variant.specification)
+            .unwrap_or(self.specification);
         anyhow::ensure!(
-            self.specification.vertex_count.fixed().is_none(),
+            specification.vertex_count.fixed().is_none(),
             "{} draws a fixed vertex count per instance",
             self.label
         );
-        self.draw(frame, None, vertex_count, InstanceRange::SINGLE)
+        self.draw_with_variant(frame, None, vertex_count, InstanceRange::SINGLE, variant)
     }
 
     fn draw(
@@ -2155,6 +2384,7 @@ fn create_path_intermediate_texture(
     device: &ID3D11Device,
     width: u32,
     height: u32,
+    storage: DXGI_FORMAT,
 ) -> Result<(ID3D11Texture2D, Option<ID3D11ShaderResourceView>)> {
     let texture = unsafe {
         let mut output = None;
@@ -2163,7 +2393,7 @@ fn create_path_intermediate_texture(
             Height: height,
             MipLevels: 1,
             ArraySize: 1,
-            Format: RENDER_TARGET_FORMAT,
+            Format: storage,
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
@@ -2177,10 +2407,8 @@ fn create_path_intermediate_texture(
         output.unwrap()
     };
 
-    let mut shader_resource_view = None;
-    unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut shader_resource_view))? };
-
-    Ok((texture, Some(shader_resource_view.unwrap())))
+    let shader_resource_view = create_texture_view(device, &texture, RENDER_TARGET_FORMAT)?;
+    Ok((texture, shader_resource_view))
 }
 
 /// Create a color texture usable as both a render target and a shader resource, returning both
@@ -2222,11 +2450,90 @@ fn create_color_target(
     Ok((texture, rtv, srv))
 }
 
+/// A render-target view of a 2D texture's first mip in `format`, which a typeless texture
+/// needs: a view without a description takes the texture's own format.
+fn create_target_view(
+    device: &ID3D11Device,
+    texture: &ID3D11Texture2D,
+    format: DXGI_FORMAT,
+    multisampled: bool,
+) -> Result<Option<ID3D11RenderTargetView>> {
+    let desc = if multisampled {
+        D3D11_RENDER_TARGET_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2DMS,
+            Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
+                Texture2DMS: D3D11_TEX2DMS_RTV::default(),
+            },
+        }
+    } else {
+        D3D11_RENDER_TARGET_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
+                Texture2D: D3D11_TEX2D_RTV { MipSlice: 0 },
+            },
+        }
+    };
+    let mut view = None;
+    unsafe { device.CreateRenderTargetView(texture, Some(&desc), Some(&mut view))? };
+    Ok(view)
+}
+
+/// A shader-resource view of a single-mip 2D texture in `format` (see `create_target_view`).
+fn create_texture_view(
+    device: &ID3D11Device,
+    texture: &ID3D11Texture2D,
+    format: DXGI_FORMAT,
+) -> Result<Option<ID3D11ShaderResourceView>> {
+    let desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+        Format: format,
+        ViewDimension: D3D_SRV_DIMENSION_TEXTURE2D,
+        Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+            Texture2D: D3D11_TEX2D_SRV {
+                MostDetailedMip: 0,
+                MipLevels: 1,
+            },
+        },
+    };
+    let mut view = None;
+    unsafe { device.CreateShaderResourceView(texture, Some(&desc), Some(&mut view))? };
+    Ok(view)
+}
+
+/// Logs that paths blend in gamma space because `what`, for linear paths through
+/// `LINEAR_PATH_FORMAT`, could not be made.
+fn log_gamma_fallback(what: &str, error: &anyhow::Error) {
+    log::warn!("Paths blend in gamma space: {what} for linear paths could not be made: {error:#}");
+}
+
+/// Whether the device can draw paths through `LINEAR_PATH_FORMAT`: sample it and render,
+/// blend, multisample 4x and resolve in it. D3D11 hardware is required to, so a device that
+/// cannot keeps the `RENDER_TARGET_FORMAT` path pipeline instead.
+fn linear_paths_supported(device: &ID3D11Device) -> bool {
+    let needed = [
+        D3D11_FORMAT_SUPPORT_TEXTURE2D,
+        D3D11_FORMAT_SUPPORT_SHADER_SAMPLE,
+        D3D11_FORMAT_SUPPORT_RENDER_TARGET,
+        D3D11_FORMAT_SUPPORT_BLENDABLE,
+        D3D11_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET,
+        D3D11_FORMAT_SUPPORT_MULTISAMPLE_RESOLVE,
+    ]
+    .iter()
+    .fold(0u32, |bits, support| bits | support.0 as u32);
+    let support = unsafe { device.CheckFormatSupport(LINEAR_PATH_FORMAT) }.unwrap_or(0);
+    let quality_levels =
+        unsafe { device.CheckMultisampleQualityLevels(LINEAR_PATH_FORMAT, PATH_MULTISAMPLE_COUNT) }
+            .unwrap_or(0);
+    support & needed == needed && quality_levels > 0
+}
+
 #[inline]
 fn create_path_intermediate_msaa_texture_and_view(
     device: &ID3D11Device,
     width: u32,
     height: u32,
+    storage: DXGI_FORMAT,
 ) -> Result<(ID3D11Texture2D, Option<ID3D11RenderTargetView>)> {
     let msaa_texture = unsafe {
         let mut output = None;
@@ -2235,7 +2542,7 @@ fn create_path_intermediate_msaa_texture_and_view(
             Height: height,
             MipLevels: 1,
             ArraySize: 1,
-            Format: RENDER_TARGET_FORMAT,
+            Format: storage,
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: PATH_MULTISAMPLE_COUNT,
                 Quality: D3D11_STANDARD_MULTISAMPLE_PATTERN.0 as u32,
@@ -2248,9 +2555,8 @@ fn create_path_intermediate_msaa_texture_and_view(
         device.CreateTexture2D(&desc, None, Some(&mut output))?;
         output.unwrap()
     };
-    let mut msaa_view = None;
-    unsafe { device.CreateRenderTargetView(&msaa_texture, None, Some(&mut msaa_view))? };
-    Ok((msaa_texture, Some(msaa_view.unwrap())))
+    let msaa_view = create_target_view(device, &msaa_texture, RENDER_TARGET_FORMAT, true)?;
+    Ok((msaa_texture, msaa_view))
 }
 
 #[inline]
@@ -2332,8 +2638,9 @@ fn create_blend_state_for_subpixel_rendering(device: &ID3D11Device) -> Result<ID
 
 #[inline]
 fn create_blend_state_for_path_rasterization(device: &ID3D11Device) -> Result<ID3D11BlendState> {
-    // If the feature level is set to greater than D3D_FEATURE_LEVEL_9_3, the display
-    // device performs the blend in linear space, which is ideal.
+    // Premultiplied blending. The hardware blends in linear light only through a
+    // `LINEAR_PATH_FORMAT` view; through a `RENDER_TARGET_FORMAT` view it blends the encoded
+    // values.
     let mut desc = D3D11_BLEND_DESC::default();
     desc.RenderTarget[0].BlendEnable = true.into();
     desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
@@ -2352,8 +2659,9 @@ fn create_blend_state_for_path_rasterization(device: &ID3D11Device) -> Result<ID
 
 #[inline]
 fn create_blend_state_for_path_sprite(device: &ID3D11Device) -> Result<ID3D11BlendState> {
-    // If the feature level is set to greater than D3D_FEATURE_LEVEL_9_3, the display
-    // device performs the blend in linear space, which is ideal.
+    // Premultiplied blending. The hardware blends in linear light only through a
+    // `LINEAR_PATH_FORMAT` view; through a `RENDER_TARGET_FORMAT` view it blends the encoded
+    // values.
     let mut desc = D3D11_BLEND_DESC::default();
     desc.RenderTarget[0].BlendEnable = true.into();
     desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
@@ -2522,6 +2830,7 @@ pub(crate) mod shader_resources {
         SmoothedShadow,
         Underline,
         PathRasterization,
+        PathRasterizationLinear,
         PathSprite,
         MonochromeSprite,
         SubpixelSprite,
@@ -2537,13 +2846,14 @@ pub(crate) mod shader_resources {
 
     impl ShaderModule {
         #[cfg(test)]
-        const ALL: [Self; 17] = [
+        const ALL: [Self; 18] = [
             Self::Quad,
             Self::SmoothedQuad,
             Self::Shadow,
             Self::SmoothedShadow,
             Self::Underline,
             Self::PathRasterization,
+            Self::PathRasterizationLinear,
             Self::PathSprite,
             Self::MonochromeSprite,
             Self::SubpixelSprite,
@@ -2565,6 +2875,7 @@ pub(crate) mod shader_resources {
                 Self::SmoothedShadow => "smoothed_shadows",
                 Self::Underline => "underlines",
                 Self::PathRasterization => "path_rasterization",
+                Self::PathRasterizationLinear => "path_rasterization_linear",
                 Self::PathSprite => "paths",
                 Self::MonochromeSprite => "monochrome_sprites",
                 Self::SubpixelSprite => "subpixel_sprites",
@@ -2840,10 +3151,11 @@ mod tests {
     use crate::directx_devices::DirectXDevices;
     use anyhow::Result;
     use gpui::{
-        AtlasKey, AtlasTile, BorderStyle, Bounds, ContentMask, Corners, DevicePixels, Edges,
-        ImageId, MonochromeSprite, PlatformAtlas, Point, PolychromeSprite, PrimitiveBatch, Quad,
-        RenderCommand, RenderImageParams, RenderSvgParams, ScaledPixels, Scene, ShaderBool, Size,
-        WindowBackgroundAppearance, hsla, rgb, rgb_to_hsla, solid_background,
+        AtlasKey, AtlasTile, BackdropFilter, BorderStyle, Bounds, ContentMask, Corners,
+        DevicePixels, Edges, ImageId, MonochromeSprite, Path, PlatformAtlas, Point,
+        PolychromeSprite, PrimitiveBatch, Quad, RenderCommand, RenderImageParams, RenderSvgParams,
+        ScaledPixels, Scene, ShaderBool, Size, WindowBackgroundAppearance, hsla, point, px, rgb,
+        rgb_to_hsla, solid_background,
     };
     use std::borrow::Cow;
     use windows::Win32::Foundation::HWND;
@@ -3077,6 +3389,89 @@ mod tests {
         expect("polychrome sprite", 55, 65, [255, 0, 0]);
         expect("second quad batch", 85, 85, [0, 0, 255]);
         expect("background", 190, 20, [255, 255, 255]);
+        Ok(())
+    }
+
+    /// A scene with one square path from (10, 10) to (90, 90) in `color`, and with `filtered`
+    /// a backdrop blur clear of it, which draws the scene into the offscreen scene target.
+    fn square_path_scene(color: gpui::Hsla, filtered: bool) -> Scene {
+        let mut path = Path::new(point(px(10.0), px(10.0)));
+        path.line_to(point(px(90.0), px(10.0)));
+        path.line_to(point(px(90.0), px(90.0)));
+        path.line_to(point(px(10.0), px(90.0)));
+        let mut path = path.scale(1.0);
+        path.content_mask = full_mask();
+        path.color = solid_background(color);
+        let mut scene = Scene::default();
+        scene.insert_primitive(path);
+        if filtered {
+            let bounds = scaled(94.0, 94.0, 4.0, 4.0);
+            scene.insert_primitive(BackdropFilter {
+                bounds,
+                content_mask: ContentMask { bounds },
+                filters: smallvec::smallvec![gpui::ScaledFilter::Blur(ScaledPixels(1.0))],
+                opacity: 1.0,
+                ..BackdropFilter::default()
+            });
+        }
+        scene.finish();
+        assert_eq!(scene.requires_offscreen_rendering(), filtered);
+        scene
+    }
+
+    /// Paths blend in linear light on an opaque window: half-transparent black over the
+    /// white background is half the light, which sRGB encodes as 188, not 128. A transparent
+    /// window's buffer is composited as gamma-premultiplied colour, so there half-transparent
+    /// white must stay 128 (premultiplied), not 188. So must it in the offscreen scene target
+    /// on an opaque window: it starts transparent and replaces the window's pixels.
+    #[test]
+    fn paths_blend_in_linear_light_only_over_an_opaque_window() -> Result<()> {
+        let window = HiddenWindow::new()?;
+        let devices = DirectXDevices::new()?;
+        let mut renderer = DirectXRenderer::new(window.0, &devices, true)?;
+        renderer.resize(Size {
+            width: DevicePixels(100),
+            height: DevicePixels(100),
+        })?;
+        let channels = |renderer: &mut DirectXRenderer,
+                        color,
+                        appearance: WindowBackgroundAppearance,
+                        filtered|
+         -> Result<[u8; 3]> {
+            let image =
+                renderer.render_to_image(&square_path_scene(color, filtered), appearance)?;
+            let [r, g, b, _] = image.get_pixel(50, 50).0;
+            Ok([r, g, b])
+        };
+        let close = |actual: [u8; 3], wanted: u8| actual.iter().all(|c| c.abs_diff(wanted) <= 4);
+
+        let opaque = channels(
+            &mut renderer,
+            hsla(0.0, 0.0, 0.0, 0.5),
+            WindowBackgroundAppearance::Opaque,
+            false,
+        )?;
+        assert!(
+            close(opaque, 188),
+            "half-transparent black over an opaque white window rendered {opaque:?}, expected 188"
+        );
+        for (appearance, filtered) in [
+            (WindowBackgroundAppearance::Transparent, false),
+            (WindowBackgroundAppearance::Blurred, false),
+            (WindowBackgroundAppearance::Opaque, true),
+        ] {
+            let gamma = channels(
+                &mut renderer,
+                hsla(0.0, 0.0, 1.0, 0.5),
+                appearance,
+                filtered,
+            )?;
+            assert!(
+                close(gamma, 128),
+                "half-transparent white over a {appearance:?} window, offscreen {filtered}, \
+                 rendered {gamma:?}, expected premultiplied 128"
+            );
+        }
         Ok(())
     }
 }

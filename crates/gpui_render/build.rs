@@ -802,6 +802,12 @@ fn write_native_shaders(out_dir: &std::path::Path) {
             requires_dual_source_lowering: false,
         },
         NativeShaderModule {
+            pipeline: &PATH_RASTERIZATION_LINEAR,
+            pipeline_path: "PATH_RASTERIZATION_LINEAR",
+            source: &shaders::path_rasterization::WGSL_SOURCE,
+            requires_dual_source_lowering: false,
+        },
+        NativeShaderModule {
             pipeline: &PATHS,
             pipeline_path: "PATHS",
             source: &shaders::path::WGSL_SOURCE,

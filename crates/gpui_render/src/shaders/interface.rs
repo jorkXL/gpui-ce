@@ -114,6 +114,17 @@ define_pipelines! {
     SMOOTHED_BLUR_COMPOSITE: "smoothed_blur_composite", vertex_smoothed_blur_composite, fragment_smoothed_blur_composite, TriangleStrip, Blur, Rectangle;
 }
 
+/// [`PATH_RASTERIZATION`] with linear-light output, for DirectX's `_UNORM_SRGB` path views.
+/// Only DirectX uses it, so it is not in [`ALL`].
+pub const PATH_RASTERIZATION_LINEAR: Pipeline = Pipeline {
+    label: "path_rasterization_linear",
+    vertex_entry: "vertex_path_rasterization",
+    fragment_entry: "fragment_path_rasterization_linear",
+    topology: PrimitiveTopology::TriangleList,
+    data_layout: DataLayout::Instances,
+    vertex_count: VertexCount::Dynamic,
+};
+
 pub const EMOJI_RASTERIZATION: Pipeline = Pipeline {
     label: "emoji_rasterization",
     vertex_entry: "vertex_emoji_rasterization",

@@ -63,6 +63,27 @@ pub mod path_rasterization {
         let color = paint_color(paint, input.position.xy(), prepare_paint(paint));
         premultiply(color, coverage)
     }
+
+    /// The paint colour premultiplied by coverage, in linear light: what a render target
+    /// that blends in linear light needs, as DirectX's `_UNORM_SRGB` path views do. The
+    /// hardware decodes the destination, blends and encodes again, so coverage mixes light,
+    /// not encoded values, and an opaque colour still lands on its own 8-bit value.
+    pub fn premultiply_linear(color: Vec4f, coverage: f32) -> Vec4f {
+        premultiply(srgba_to_linear(color), coverage)
+    }
+
+    /// [`fragment_path_rasterization`] for a target that blends in linear light.
+    #[fragment]
+    pub fn fragment_path_rasterization_linear(input: PathRasterizationVarying) -> Vec4f {
+        let coverage = quadratic_bezier_coverage(input.curve_position);
+        if is_clipped(input.clip_distances) {
+            return transparent();
+        }
+        let vertex = get!(PATH_VERTICES)[input.vertex_id as usize];
+        let paint = Paint::new(vertex.color, vertex.bounds);
+        let color = paint_color(paint, input.position.xy(), prepare_paint(paint));
+        premultiply_linear(color, coverage)
+    }
 }
 
 #[wgsl_rs::wgsl]
