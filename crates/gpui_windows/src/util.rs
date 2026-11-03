@@ -63,8 +63,15 @@ impl HiLoWord for LPARAM {
 pub(crate) fn guard_callback<R>(fallback: impl FnOnce() -> R, f: impl FnOnce() -> R) -> R {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(result) => result,
-        Err(_) => {
-            log::error!("a panic in a Windows callback was caught");
+        Err(payload) => {
+            // Recovery must not panic in turn: dropping a payload can, and so can the
+            // logger. So each payload is leaked, and the log's panic is caught.
+            std::mem::forget(payload);
+            if let Err(payload) = std::panic::catch_unwind(|| {
+                log::error!("a panic in a Windows callback was caught");
+            }) {
+                std::mem::forget(payload);
+            }
             fallback()
         }
     }
@@ -182,4 +189,23 @@ pub(crate) fn system_appearance() -> Result<WindowAppearance> {
 #[inline(always)]
 fn is_color_light(color: &Color) -> bool {
     ((5 * color.G as u32) + (2 * color.R as u32) + color.B as u32) > (8 * 128)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::guard_callback;
+
+    struct PanicsOnDrop;
+
+    impl Drop for PanicsOnDrop {
+        fn drop(&mut self) {
+            panic!("the payload's drop panicked");
+        }
+    }
+
+    #[test]
+    fn test_guard_callback_survives_a_payload_that_panics_on_drop() {
+        let result = guard_callback(|| 1, || std::panic::panic_any(PanicsOnDrop));
+        assert_eq!(result, 1);
+    }
 }
