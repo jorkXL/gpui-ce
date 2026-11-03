@@ -1764,6 +1764,11 @@ fn no_watch(_: &IFileDialog) -> Option<Watch> {
 }
 
 /// The watch's timer callback: closes the dialog once its caller stopped waiting.
+///
+/// # Safety
+///
+/// Only the message loop of the thread whose `Watch::start` set the timer may call it, as
+/// `SetTimer` arranges: the dialog in that thread's `WATCHED` belongs to its apartment.
 unsafe extern "system" fn close_abandoned_dialog(_: HWND, _: u32, _: usize, _: u32) {
     guard_callback(
         || (),
@@ -1821,6 +1826,9 @@ fn file_open_dialog(
         dialog_options |= FOS_PICKFOLDERS;
     }
 
+    // SAFETY: the dialog was made on this thread, in its apartment, and lives past the calls.
+    // The prompt's `HSTRING` lives until `SetOkButtonLabel` returns, and the dialog copies it
+    // during the call.
     unsafe {
         folder_dialog.SetOptions(dialog_options)?;
 
@@ -1833,6 +1841,9 @@ fn file_open_dialog(
     let shown = {
         // Armed only while the dialog shows: its timer runs in `Show`'s message loop.
         let _watch = watch(&folder_dialog);
+        // SAFETY: the dialog was made on this thread, in its apartment, and `Show` runs its
+        // modal loop here. `window` is a handle, which Windows checks, not a pointer: `None` on
+        // the dialog thread, or GPUI's active window when GPUI's thread shows the dialog.
         unsafe { folder_dialog.Show(window) }
     };
     if !file_open_dialog_accepted(shown)? {
@@ -1889,6 +1900,9 @@ fn file_save_dialog(
         };
     }
 
+    // SAFETY: the dialog was made on this thread, in its apartment. The filter's strings are
+    // static. The array lives until `SetFileTypes` returns, and the dialog copies the filters
+    // during the call, as this code relied on before the dialog moved threads.
     unsafe {
         dialog.SetFileTypes(&[Common::COMDLG_FILTERSPEC {
             pszName: windows::core::w!("All files"),
@@ -1898,6 +1912,8 @@ fn file_save_dialog(
     let shown = {
         // Armed only while the dialog shows: its timer runs in `Show`'s message loop.
         let _watch = watch(&dialog);
+        // SAFETY: as for the open dialog's `Show`: made on this thread, in its apartment, and
+        // `window` is `None` or GPUI's active window, a handle that Windows checks.
         unsafe { dialog.Show(window) }
     };
     if shown.is_err() {
