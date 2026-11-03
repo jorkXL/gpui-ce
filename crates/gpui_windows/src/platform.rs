@@ -1,6 +1,7 @@
 use std::{
     cell::{Cell, RefCell},
     ffi::{OsStr, OsString},
+    marker::PhantomData,
     os::windows::ffi::{OsStrExt as _, OsStringExt as _},
     path::{Path, PathBuf},
     rc::{Rc, Weak},
@@ -773,10 +774,14 @@ impl Platform for WindowsPlatform {
         options: PathPromptOptions,
     ) -> Receiver<Result<Option<Vec<PathBuf>>>> {
         let (tx, rx) = oneshot::channel();
+        if self.embedded {
+            show_on_dialog_thread(tx, move |watch| file_open_dialog(options, None, watch));
+            return rx;
+        }
         let window = self.find_current_active_window();
         self.foreground_executor()
             .spawn(async move {
-                run_file_open_prompt(tx, || file_open_dialog(options, window));
+                run_file_open_prompt(tx, || file_open_dialog(options, window, &no_watch));
             })
             .detach();
 
@@ -791,10 +796,21 @@ impl Platform for WindowsPlatform {
         let directory = directory.to_owned();
         let suggested_name = suggested_name.map(|s| s.to_owned());
         let (tx, rx) = oneshot::channel();
+        if self.embedded {
+            show_on_dialog_thread(tx, move |watch| {
+                file_save_dialog(directory, suggested_name, None, watch)
+            });
+            return rx;
+        }
         let window = self.find_current_active_window();
         self.foreground_executor()
             .spawn(async move {
-                let _ = tx.send(file_save_dialog(directory, suggested_name, window));
+                let _ = tx.send(file_save_dialog(
+                    directory,
+                    suggested_name,
+                    window,
+                    &no_watch,
+                ));
             })
             .detach();
 
@@ -1603,6 +1619,156 @@ fn run_file_open_prompt(
     let _ = tx.send(open_dialog());
 }
 
+/// How often a dialog on its own thread checks whether anyone still waits for its answer.
+const DIALOG_WATCH_MS: u32 = 100;
+
+/// Shows an embedded platform's file dialog on a thread of its own, in a single-threaded
+/// apartment, and sends its answer on `tx`. `show` runs the dialog, and starts its watch
+/// with the function it is given.
+///
+/// A dialog runs its own modal loop on the thread that shows it, and on the host's UI thread
+/// that loop and the dialog's close held the host's whole UI. The dialog has no owner window:
+/// an owner on the host's UI thread would disable the host's window and join the two threads'
+/// input, so the host would still wait on the dialog. Without one, the host and GPUI's windows
+/// keep painting and taking input, and the dialog has its own taskbar button. It closes once
+/// `tx`'s receiver drops, when the caller replaced the request or closed its window.
+fn show_on_dialog_thread<T: Send + 'static>(
+    tx: oneshot::Sender<Result<T>>,
+    show: impl FnOnce(&dyn Fn(&IFileDialog) -> Option<Watch>) -> Result<T> + Send + 'static,
+) {
+    let spawned = std::thread::Builder::new()
+        .name("gpui-file-dialog".into())
+        .spawn(move || {
+            // A request dropped before its thread ran shows nothing, as `run_file_open_prompt`.
+            if tx.is_canceled() {
+                return;
+            }
+            let apartment = match Apartment::enter() {
+                Ok(apartment) => apartment,
+                Err(error) => {
+                    let _ = tx.send(Err(error));
+                    return;
+                }
+            };
+            let tx = Rc::new(RefCell::new(Some(tx)));
+            let watch = |dialog: &IFileDialog| {
+                let waiting = tx.clone();
+                Watch::start(
+                    dialog,
+                    Box::new(move || {
+                        waiting
+                            .borrow()
+                            .as_ref()
+                            .is_none_or(oneshot::Sender::is_canceled)
+                    }),
+                )
+            };
+            // As text, so a Windows error's COM error info is released in this apartment.
+            let result = show(&watch).map_err(|error| anyhow!("{error:#}"));
+            if let Some(tx) = tx.borrow_mut().take() {
+                let _ = tx.send(result);
+            }
+            drop(apartment);
+        });
+    if let Err(error) = spawned {
+        // The dropped sender answers the receiver with `Canceled`.
+        log::error!("unable to start a file dialog thread: {error}");
+    }
+}
+
+/// COM entered on this thread as a single-threaded apartment, which the file dialogs need,
+/// until the drop.
+struct Apartment(PhantomData<*const ()>);
+
+impl Apartment {
+    fn enter() -> Result<Self> {
+        // SAFETY: runs on the dialog thread, which nothing else has entered COM on. The drop
+        // pairs it with `CoUninitialize` on the same thread (`Apartment` isn't `Send`), after
+        // `show_on_dialog_thread` has released the thread's COM objects.
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) }
+            .ok()
+            .context("unable to initialize COM for a file dialog")?;
+        Ok(Self(PhantomData))
+    }
+}
+
+impl Drop for Apartment {
+    fn drop(&mut self) {
+        // SAFETY: pairs with the successful `CoInitializeEx` of `enter`, on the same thread.
+        unsafe { CoUninitialize() };
+    }
+}
+
+thread_local! {
+    /// The dialog this thread shows, and whether its caller stopped waiting for its answer,
+    /// for `close_abandoned_dialog`.
+    static WATCHED: RefCell<Option<(IFileDialog, Box<dyn Fn() -> bool>)>> =
+        const { RefCell::new(None) };
+}
+
+/// Closes this thread's dialog while it shows, once nobody waits for its answer: a thread
+/// timer, which the dialog's own message loop runs.
+struct Watch {
+    timer: usize,
+    _thread: PhantomData<*const ()>,
+}
+
+impl Watch {
+    fn start(dialog: &IFileDialog, abandoned: Box<dyn Fn() -> bool>) -> Option<Self> {
+        WATCHED.set(Some((dialog.clone(), abandoned)));
+        // SAFETY: a timer with no window belongs to this thread. Only this thread's message
+        // loop, which the dialog's `Show` runs, calls its callback, and the drop kills it here.
+        let timer = unsafe { SetTimer(None, 0, DIALOG_WATCH_MS, Some(close_abandoned_dialog)) };
+        if timer == 0 {
+            log::error!(
+                "unable to watch a file dialog: {}",
+                std::io::Error::last_os_error()
+            );
+            WATCHED.set(None);
+            return None;
+        }
+        Some(Self {
+            timer,
+            _thread: PhantomData,
+        })
+    }
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        // SAFETY: `self.timer` is the timer `start` made on this thread, which drops `self`
+        // (`Watch` isn't `Send`).
+        unsafe { KillTimer(None, self.timer) }.log_err();
+        WATCHED.set(None);
+    }
+}
+
+/// No watch, for a dialog modal to its owner on GPUI's thread: nothing can drop its receiver
+/// while it shows.
+fn no_watch(_: &IFileDialog) -> Option<Watch> {
+    None
+}
+
+/// The watch's timer callback: closes the dialog once its caller stopped waiting.
+unsafe extern "system" fn close_abandoned_dialog(_: HWND, _: u32, _: usize, _: u32) {
+    guard_callback(
+        || (),
+        || {
+            let abandoned = WATCHED.with_borrow(|watched| {
+                watched.as_ref().is_some_and(|(_, abandoned)| abandoned())
+            });
+            // Taken, so a later tick doesn't close it again, and out of the cell before
+            // `Close` runs the dialog's code.
+            let Some((dialog, _)) = abandoned.then(|| WATCHED.take()).flatten() else {
+                return;
+            };
+            // SAFETY: this thread made the dialog in its apartment, and the timer only runs
+            // inside the dialog's `Show`, while the dialog is open, where `Close` may end it.
+            unsafe { dialog.Close(HRESULT::from_win32(ERROR_CANCELLED.0)) }.log_err();
+        },
+    )
+}
+
 fn file_open_dialog_accepted(
     show_result: windows::core::Result<()>,
 ) -> windows::core::Result<bool> {
@@ -1616,6 +1782,7 @@ fn file_open_dialog_accepted(
 fn file_open_dialog(
     options: PathPromptOptions,
     window: Option<HWND>,
+    watch: &dyn Fn(&IFileDialog) -> Option<Watch>,
 ) -> Result<Option<Vec<PathBuf>>> {
     let folder_dialog: IFileOpenDialog =
         unsafe { CoCreateInstance(&FileOpenDialog, None, CLSCTX_ALL)? };
@@ -1635,7 +1802,10 @@ fn file_open_dialog(
             let prompt: &str = &prompt;
             folder_dialog.SetOkButtonLabel(&HSTRING::from(prompt))?;
         }
+    }
 
+    let _watch = watch(&folder_dialog);
+    unsafe {
         if !file_open_dialog_accepted(folder_dialog.Show(window))? {
             return Ok(None);
         }
@@ -1661,6 +1831,7 @@ fn file_save_dialog(
     directory: PathBuf,
     suggested_name: Option<String>,
     window: Option<HWND>,
+    watch: &dyn Fn(&IFileDialog) -> Option<Watch>,
 ) -> Result<Option<PathBuf>> {
     let dialog: IFileSaveDialog = unsafe { CoCreateInstance(&FileSaveDialog, None, CLSCTX_ALL)? };
     if !directory.to_string_lossy().is_empty()
@@ -1690,6 +1861,7 @@ fn file_save_dialog(
         };
     }
 
+    let _watch = watch(&dialog);
     unsafe {
         dialog.SetFileTypes(&[Common::COMDLG_FILTERSPEC {
             pszName: windows::core::w!("All files"),
@@ -1916,7 +2088,10 @@ mod tests {
     use crate::{read_from_clipboard, write_to_clipboard};
     use gpui::ClipboardItem;
 
-    use super::{encode_restart_arguments, file_open_dialog_accepted, run_file_open_prompt};
+    use super::{
+        encode_restart_arguments, file_open_dialog_accepted, run_file_open_prompt,
+        show_on_dialog_thread,
+    };
 
     #[test]
     fn test_file_open_prompt_skips_dropped_receiver() {
@@ -1944,6 +2119,40 @@ mod tests {
         });
         assert_eq!(calls.get(), 1);
         assert_eq!(rx.try_recv().unwrap().unwrap().unwrap(), Some(paths));
+    }
+
+    #[test]
+    fn test_dialog_thread_delivers_result() {
+        use windows::Win32::System::Com::{
+            APTTYPE, APTTYPE_STA, APTTYPEQUALIFIER, CoGetApartmentType,
+        };
+        let (tx, rx) = futures::channel::oneshot::channel();
+        show_on_dialog_thread(tx, |_| {
+            // The thread entered its own single-threaded apartment.
+            let mut kind = APTTYPE::default();
+            let mut qualifier = APTTYPEQUALIFIER::default();
+            // SAFETY: both pointers are to locals that outlive the call.
+            unsafe { CoGetApartmentType(&mut kind, &mut qualifier) }?;
+            Ok(kind)
+        });
+        let apartment = futures::executor::block_on(rx).unwrap().unwrap();
+        assert_eq!(apartment, APTTYPE_STA);
+    }
+
+    #[test]
+    fn test_dialog_thread_skips_dropped_receiver() {
+        let (tx, rx) = futures::channel::oneshot::channel::<anyhow::Result<()>>();
+        let (shown, was_shown) = std::sync::mpsc::channel();
+        drop(rx);
+        show_on_dialog_thread(tx, move |_| {
+            let _ = shown.send(());
+            Ok(())
+        });
+        // The thread drops `show` without calling it.
+        assert_eq!(
+            was_shown.recv_timeout(std::time::Duration::from_secs(10)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        );
     }
 
     #[test]
